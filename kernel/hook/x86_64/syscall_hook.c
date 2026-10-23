@@ -213,10 +213,33 @@ bool ksu_has_syscall_hook(int nr)
 static void *x64_sys_call_patch_addr;
 static char x64_sys_call_patch_orig_insn[14];
 
-static long my_x64_sys_call(const struct pt_regs *regs, unsigned int nr)
+/*
+ * patch_abs_jump() redirects with an indirect jmp. With IBT on, that jmp must
+ * land on endbr64, but FineIBT turns the endbr64 at the entry of every kCFI
+ * function into a nop, so jumping straight to a C function faults ("Missing
+ * ENDBR"). Land on a stub that keeps its own endbr64 and direct-jumps on;
+ * endbr64 executes as a nop on CPUs without IBT.
+ */
+#define KSU_IBT_TRAMPOLINE(name, target) \
+    asm(".pushsection .text, \"ax\"\n" \
+        ".type " #name ", @function\n" \
+        ".globl " #name "\n" \
+        #name ":\n" \
+        "endbr64\n" \
+        "jmp " #target "\n" \
+        "int3\n" \
+        ".size " #name ", .-" #name "\n" \
+        ".popsection\n")
+
+// Not static: the trampoline references it by name from asm.
+long ksu_my_x64_sys_call(const struct pt_regs *regs, unsigned int nr);
+void ksu_x64_sys_call_tramp(void);
+
+__visible long ksu_my_x64_sys_call(const struct pt_regs *regs, unsigned int nr)
 {
     return ksu_syscall_table[nr](regs);
 }
+KSU_IBT_TRAMPOLINE(ksu_x64_sys_call_tramp, ksu_my_x64_sys_call);
 
 // avd 13-5.15 missing this commit:
 // https://github.com/torvalds/linux/commit/fb13b11d53875e28e7fbf0c26b288e4ea676aa9f
@@ -244,7 +267,10 @@ static __always_inline bool my_do_syscall_x64(struct pt_regs *regs, int nr)
     return false;
 }
 
-static void __nocfi my_do_syscall_64(struct pt_regs *regs, int nr)
+void ksu_my_do_syscall_64(struct pt_regs *regs, int nr);
+void ksu_do_syscall_64_tramp(void);
+
+__visible void __nocfi ksu_my_do_syscall_64(struct pt_regs *regs, int nr)
 {
     nr = syscall_enter_from_user_mode_fn(regs, nr);
     nr = syscall_get_nr(current, regs);
@@ -258,6 +284,7 @@ static void __nocfi my_do_syscall_64(struct pt_regs *regs, int nr)
 
     syscall_exit_to_user_mode_fn(regs);
 }
+KSU_IBT_TRAMPOLINE(ksu_do_syscall_64_tramp, ksu_my_do_syscall_64);
 #endif
 #endif
 
@@ -308,14 +335,14 @@ void __init __nocfi ksu_syscall_hook_init(void)
         return;
 
 #ifdef CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER
-    patch_abs_jump("x64_sys_call", &x64_sys_call_patch_addr, my_x64_sys_call, x64_sys_call_patch_orig_insn);
+    patch_abs_jump("x64_sys_call", &x64_sys_call_patch_addr, ksu_x64_sys_call_tramp, x64_sys_call_patch_orig_insn);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
     syscall_enter_from_user_mode_fn = find_kernel_symbol_exact("syscall_enter_from_user_mode");
     syscall_exit_to_user_mode_fn = find_kernel_symbol_exact("syscall_exit_to_user_mode");
     pr_info("syscall_enter_from_user_mode: 0x%lx, syscall_exit_to_user_mode: 0x%lx\n",
             (unsigned long)syscall_enter_from_user_mode_fn, (unsigned long)syscall_exit_to_user_mode_fn);
     if (syscall_enter_from_user_mode_fn && syscall_exit_to_user_mode_fn) {
-        patch_abs_jump("do_syscall_64", &do_syscall_64_patch_addr, my_do_syscall_64, do_syscall_64_orig_insn);
+        patch_abs_jump("do_syscall_64", &do_syscall_64_patch_addr, ksu_do_syscall_64_tramp, do_syscall_64_orig_insn);
     }
 #endif
 #endif
